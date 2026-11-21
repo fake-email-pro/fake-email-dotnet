@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{D928F330-DE94-45C7-BB12-C211B48B2F9C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FakeEmailPro", "src\FakeEmailPro\FakeEmailPro.csproj", "{802F14F2-19DF-495F-B9D1-96E6D1C80918}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{A7D7EF9F-1122-4C4C-964C-8E18886B9555}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FakeEmailPro.Tests", "tests\FakeEmailPro.Tests\FakeEmailPro.Tests.csproj", "{D768018C-9DCB-44A5-BB0F-CE1ABF61192F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{802F14F2-19DF-495F-B9D1-96E6D1C80918}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{802F14F2-19DF-495F-B9D1-96E6D1C80918}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{802F14F2-19DF-495F-B9D1-96E6D1C80918}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{802F14F2-19DF-495F-B9D1-96E6D1C80918}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D768018C-9DCB-44A5-BB0F-CE1ABF61192F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D768018C-9DCB-44A5-BB0F-CE1ABF61192F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D768018C-9DCB-44A5-BB0F-CE1ABF61192F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D768018C-9DCB-44A5-BB0F-CE1ABF61192F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{802F14F2-19DF-495F-B9D1-96E6D1C80918} = {D928F330-DE94-45C7-BB12-C211B48B2F9C}
+		{D768018C-9DCB-44A5-BB0F-CE1ABF61192F} = {A7D7EF9F-1122-4C4C-964C-8E18886B9555}
+	EndGlobalSection
+EndGlobal

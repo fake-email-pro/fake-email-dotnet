@@ -1,0 +1,19 @@
+# Build outputs
+bin/
+obj/
+artifacts/
+*.nupkg
+*.snupkg
+
+# Test results and coverage
+TestResults/
+coverage/
+*.trx
+
+# IDE and OS junk
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+.DS_Store

@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>FakeEmailPro</RootNamespace>
+    <AssemblyName>FakeEmailPro</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+
+    <PackageId>FakeEmailPro</PackageId>
+    <Title>fake-email.pro API client</Title>
+    <Description>The official .NET client for the fake-email.pro API: create a disposable mailbox, wait for the email, get the one-time code or the magic link. Built for end-to-end tests of signup, OTP and password-reset flows with xUnit, NUnit and Playwright.</Description>
+    <Authors>fake-email.pro</Authors>
+    <Company>fake-email.pro</Company>
+    <Copyright>Copyright (c) 2026 fake-email.pro</Copyright>
+    <PackageTags>temp-mail;disposable-email;fake-email;temporary-email;email-testing;otp;e2e-testing;playwright;api-client;sdk</PackageTags>
+    <PackageProjectUrl>https://fake-email.pro/api</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/fake-email-pro/fake-email-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>https://github.com/fake-email-pro/fake-email-dotnet/blob/main/CHANGELOG.md</PackageReleaseNotes>
+
+    <!-- Source Link (built into the .NET 8+ SDK) and a symbol package. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <InternalsVisibleTo Include="FakeEmailPro.Tests" />
+  </ItemGroup>
+
+</Project>
