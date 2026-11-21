@@ -185,7 +185,11 @@ clock. Prefer a message id: it is exact, while a time depends on clock skew. Do 
 `After`: a second message in the same millisecond would be skipped.
 
 An `After` id that is no longer in the mailbox (you deleted that message) is a `NotFoundException`: if your tests
-delete processed messages, wait without `After`.
+delete processed messages, wait without `After`. A `null` or empty string (or `default(WaitAfter)`) means "no
+`After`". When the wait itself moved past a skipped message that is then deleted, it goes on after that message's
+time instead of failing.
+
+A `Timeout` of zero or less is already expired: the wait throws `WaitTimeoutException` at once.
 
 ### Cancelling
 
@@ -209,12 +213,17 @@ var full = await mail.Messages.GetAsync(address, message.Id);
 // full.Html, full.Text, full.Codes, full.Links, full.Attachments
 
 var attachment = await mail.Messages.GetAttachmentAsync(address, message.Id, full.Attachments[0].Id);
-await File.WriteAllBytesAsync(attachment.FileName ?? "attachment.bin", attachment.Data); // + attachment.ContentType
+// The sender chose the name: keep only the file name, so "../../x" cannot leave the folder.
+var name = Path.GetFileName(attachment.FileName);
+if (string.IsNullOrEmpty(name) || name is "." or "..") name = "attachment.bin";
+await File.WriteAllBytesAsync(Path.Combine(downloadDir, name), attachment.Data); // + attachment.ContentType
 
 byte[] eml = await mail.Messages.GetRawAsync(address, message.Id); // the message as received
 
 await mail.Messages.DeleteAsync(address, message.Id);
 ```
+
+`attachment.FileName` is the name from the email, or the attachment id when the email gave none.
 
 One long poll without the client-side loop: `mail.Messages.WaitAsync(address, new MessageWaitOptions { Timeout =
 TimeSpan.FromSeconds(30), After = ..., From = ..., Subject = ... })` returns the message or `null` when the server
@@ -225,7 +234,7 @@ timeout passed.
 ```csharp
 await mail.Mailboxes.CreateAsync(); // random address on a random domain
 await mail.Mailboxes.CreateAsync(new CreateMailboxOptions { Domain = "example.org" }); // random address on that domain
-await mail.Mailboxes.CreateAsync(new CreateMailboxOptions { LocalPart = "signup-test", Domain = "example.org" }); // exactly that
+await mail.Mailboxes.CreateAsync(new CreateMailboxOptions { LocalPart = "signup-test", Domain = "example.org" }); // signup-test@example.org
 
 await mail.Mailboxes.GetAsync(address);
 await mail.Mailboxes.ListAsync(page: 0, size: 50);
@@ -237,7 +246,8 @@ var limits = await mail.Limits.GetAsync(); // Quota, RequestsPerMinute, Concurre
 ```
 
 A mailbox accepts mail for 24 hours and cannot be renewed; after that it answers `404`. Each created mailbox spends one
-unit of your monthly quota (deleting it does not give it back). Custom local parts depend on the plan.
+unit of your monthly quota (deleting it does not give it back). Custom local parts depend on the plan; the server
+lowercases them (`"Signup-Test"` becomes `signup-test@...`), so use the returned `Address`.
 
 ## Errors
 
@@ -250,13 +260,13 @@ API's `error` field, see `ErrorCodes`), `Message`, `Body`, `BodyJson`, `Headers`
 | `AuthenticationException`      | 401 `unauthorized`: missing, unknown, revoked or expired key                             |
 | `QuotaExhaustedException`      | 402 `quota_exhausted`: monthly mailbox quota spent (`Limit`, `Used`, `ResetsAt`, `UpgradeUrl`) |
 | `PermissionDeniedException`    | 403 `plan_forbidden`: the plan does not allow this                                       |
-| `NotFoundException`            | 404 `not_found`: mailbox expired, deleted or not yours; no such message                  |
+| `NotFoundException`            | 404 `not_found`: mailbox expired, deleted or not yours; no such message or attachment; unknown or unavailable `Domain` on create; an `After` id that names no message of the mailbox |
 | `ConflictException`            | 409 `address_taken`: the address was issued before                                       |
 | `RateLimitException`           | 429: `Code` is `rate_limit_exceeded` or `too_many_waits`; `RetryAfter`                   |
 | `InternalServerErrorException` | 5xx                                                                                      |
 | `ApiConnectionException`       | no response (DNS, refused, reset)                                                        |
 | `ApiTimeoutException`          | an HTTP attempt took longer than `Timeout`                                               |
-| `WaitTimeoutException`         | `WaitForMessageAsync` / `WaitForCodeAsync` / `WaitForLinkAsync` reached their deadline   |
+| `WaitTimeoutException`         | `WaitForMessageAsync` / `WaitForCodeAsync` / `WaitForLinkAsync` reached their deadline (the last transient error, if any, is the `InnerException`) |
 
 ```csharp
 try
@@ -282,12 +292,18 @@ namespaces are imported, write `FakeEmailPro.AuthenticationException`.
 The client retries up to `MaxRetries` times (default 2):
 
 - `429` and `503`, for every method: the server refuses these before doing anything. The wait is `Retry-After` (at
-  most 60 s).
-- `502`, `504`, timeouts and network errors, for `GET` and `DELETE` only, never for `POST` (a mailbox could be created
-  twice). Exponential backoff with jitter: 0.5 s, 1 s, 2 s, ... up to 8 s.
+  most 60 s). A `503` whose `Retry-After` is over 5 s (e.g. no domain available to create a mailbox on) is thrown at
+  once: it will not clear up in a retry.
+- `502`, `504`, Cloudflare's `520`–`524`, timeouts and network errors, for `GET` and `DELETE` only, never for `POST` (a
+  mailbox could be created twice). Exponential backoff with jitter: 0.5 s, 1 s, 2 s, ... up to 8 s.
 
-Inside `WaitForMessageAsync` and friends, a `429` keeps being waited out while the deadline allows, and no retry is
-started that would end past the deadline.
+A `DELETE` retried after a lost response (timeout, network error, `502`/`504`/`52x`) that then gets `404` counts as
+done: the lost attempt deleted it. A `404` on the first attempt is still a `NotFoundException`.
+
+`WaitForMessageAsync` and friends retry on their own instead, until their deadline: `429`, `502`, `503`, `504`,
+`520`–`524`, network errors and HTTP timeouts are waited out (`Retry-After` if sent, else 1 s), and when the deadline
+passes the result is a `WaitTimeoutException`, never the HTTP error. No pause or request runs past the deadline. Other
+errors (`400`, `401`, `402`, `403`, `404`, `409`, `500`) are thrown at once.
 
 Your plan's numbers are in `mail.Limits.GetAsync()`. Every `ApiException` carries the window state from the
 `X-RateLimit-*` headers as `RateLimit` (`Limit`, `Remaining`, `Reset`, or `null` when the server did not send them).
@@ -308,7 +324,8 @@ var mail = new FakeEmailClient(new FakeEmailClientOptions
 ```
 
 Other settings for some calls: `mail.WithOptions(new RequestOptions { Timeout = ..., MaxRetries = 0 })` returns a view
-of the client that shares its connections.
+of the client that shares its connections. A wait request keeps at least its server timeout + 10 s, whatever `Timeout`
+says (a longer one applies), so a short timeout never cuts a long poll.
 
 ### HttpClient and dependency injection
 

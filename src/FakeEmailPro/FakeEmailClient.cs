@@ -17,6 +17,12 @@ public sealed class FakeEmailClient : IDisposable
     // A 204 that comes back far earlier than asked (a server restart) is not retried in a tight loop.
     private static readonly TimeSpan EarlyEmptyPause = TimeSpan.FromSeconds(1);
 
+    // The pause after a transient error that carries no Retry-After.
+    private static readonly TimeSpan TransientPause = TimeSpan.FromSeconds(1);
+
+    // The server's 404 message when wait?after=<id> names no message of the mailbox (deleted meanwhile).
+    private const string AfterNotFoundMessage = "message in after not found";
+
     private readonly ApiCaller _api;
     private readonly bool _ownsHttpClient;
 
@@ -127,6 +133,8 @@ public sealed class FakeEmailClient : IDisposable
 
     /// <summary>
     /// Waits until a matching message arrives, repeating server long polls until <see cref="WaitOptions.Timeout"/>.
+    /// Transient errors (429, 502, 503, 504, 520–524, connection errors, HTTP timeouts) are waited out until the
+    /// deadline; 400, 401, 402, 403, 404 and 409 are thrown at once.
     /// </summary>
     /// <param name="address">The mailbox address.</param>
     /// <param name="options">Deadline and filters.</param>
@@ -134,7 +142,7 @@ public sealed class FakeEmailClient : IDisposable
     /// <returns>The message.</returns>
     /// <exception cref="WaitTimeoutException">No matching message before the deadline.</exception>
     public Task<SimpleMessage> WaitForMessageAsync(string address, WaitOptions? options = null, CancellationToken cancellationToken = default) =>
-        WaitLoopAsync<SimpleMessage>(address, options, (message, _) => Task.FromResult<SimpleMessage?>(message), cancellationToken);
+        WaitLoopAsync<SimpleMessage>(address, options, (message, _, _) => Task.FromResult<SimpleMessage?>(message), cancellationToken);
 
     /// <summary>
     /// Waits for a message with a one-time code and returns the code. Uses the code found on delivery, else the first
@@ -149,10 +157,10 @@ public sealed class FakeEmailClient : IDisposable
         WaitLoopAsync<string>(
             address,
             options,
-            async (message, ct) =>
+            async (message, deadline, ct) =>
             {
                 if (!string.IsNullOrEmpty(message.Code)) return message.Code;
-                var full = await Messages.GetAsync(address, message.Id, ct).ConfigureAwait(false);
+                var full = await Messages.GetWithinAsync(address, message.Id, deadline, ct).ConfigureAwait(false);
                 return full.Codes.Count > 0 ? full.Codes[0] : null;
             },
             cancellationToken);
@@ -170,10 +178,10 @@ public sealed class FakeEmailClient : IDisposable
         WaitLoopAsync<string>(
             address,
             options,
-            async (message, ct) =>
+            async (message, deadline, ct) =>
             {
                 if (!string.IsNullOrEmpty(message.ConfirmLink)) return message.ConfirmLink;
-                var full = await Messages.GetAsync(address, message.Id, ct).ConfigureAwait(false);
+                var full = await Messages.GetWithinAsync(address, message.Id, deadline, ct).ConfigureAwait(false);
                 return full.Links.Count > 0 ? full.Links[0].Url : null;
             },
             cancellationToken);
@@ -187,7 +195,7 @@ public sealed class FakeEmailClient : IDisposable
     private async Task<T> WaitLoopAsync<T>(
         string address,
         WaitOptions? options,
-        Func<SimpleMessage, CancellationToken, Task<T?>> extract,
+        Func<SimpleMessage, DateTimeOffset, CancellationToken, Task<T?>> extract,
         CancellationToken ct)
         where T : class
     {
@@ -196,32 +204,38 @@ public sealed class FakeEmailClient : IDisposable
         var timeout = options?.Timeout ?? DefaultWaitTimeout;
         var deadline = hooks.Now() + timeout;
         var after = options?.After;
+        // The message the loop skipped and moved `after` to; null while `after` is the caller's own.
+        SimpleMessage? skipped = null;
+        // The last transient error, kept as the cause of a WaitTimeoutException.
+        Exception? lastError = null;
 
         while (true)
         {
             ct.ThrowIfCancellationRequested();
             var remaining = deadline - hooks.Now();
-            if (remaining <= TimeSpan.Zero) throw new WaitTimeoutException(address, timeout);
+            if (remaining <= TimeSpan.Zero) throw new WaitTimeoutException(address, timeout, lastError);
             var serverTimeout = (int)Math.Clamp(Math.Ceiling(remaining.TotalSeconds), 1, MaxServerWaitSeconds);
             var started = hooks.Now();
             SimpleMessage? message;
             try
             {
-                message = await Messages.WaitOnceAsync(address, serverTimeout, after, options?.From, options?.Subject, deadline, ct)
+                // No transport retries: this loop owns them, so none can sleep or run past the deadline.
+                message = await Messages.WaitOnceAsync(address, serverTimeout, after, options?.From, options?.Subject, 0, ct)
                     .ConfigureAwait(false);
+                lastError = null;
             }
-            catch (RateLimitException ex)
+            catch (NotFoundException ex) when (skipped is not null && IsAfterNotFound(ex))
             {
-                // The request already used its retries; a 429 (usually too_many_waits) is still worth waiting out
-                // while the caller's deadline allows.
-                var pause = ex.RetryAfter ?? TimeSpan.FromSeconds(1);
-                if (hooks.Now() + pause < deadline)
-                {
-                    await hooks.Sleep(pause, ct).ConfigureAwait(false);
-                    continue;
-                }
-
-                throw;
+                // The message we moved past was deleted meanwhile: continue after its time instead.
+                after = WaitAfter.At(skipped.CreatedAt);
+                skipped = null;
+                continue;
+            }
+            catch (FakeEmailException ex) when (IsTransient(ex))
+            {
+                lastError = ex;
+                await PauseAsync(ex, address, timeout, deadline, ct).ConfigureAwait(false);
+                continue;
             }
 
             if (message is null)
@@ -232,13 +246,55 @@ public sealed class FakeEmailClient : IDisposable
                 continue;
             }
 
-            // Continue strictly after this message whatever happens next: its id is exact, a time is not.
+            if (options?.Match is not { } match || match(message))
+            {
+                T? value;
+                try
+                {
+                    value = await extract(message, deadline, ct).ConfigureAwait(false);
+                }
+                catch (FakeEmailException ex) when (IsTransient(ex))
+                {
+                    // `after` stays put, so the next wait returns this message again.
+                    lastError = ex;
+                    await PauseAsync(ex, address, timeout, deadline, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (value is not null) return value;
+            }
+
+            // Continue strictly after this message: its id is exact, a time is not.
             after = message.Id;
-            if (options?.Match is { } match && !match(message)) continue;
-            var value = await extract(message, ct).ConfigureAwait(false);
-            if (value is not null) return value;
+            skipped = message;
         }
     }
+
+    /// <summary>Sleeps for Retry-After (else 1 s), never past the deadline; at the deadline, a WaitTimeoutException.</summary>
+    private async Task PauseAsync(FakeEmailException error, string address, TimeSpan timeout, DateTimeOffset deadline, CancellationToken ct)
+    {
+        var hooks = _api.Transport.Hooks;
+        var left = deadline - hooks.Now();
+        if (left <= TimeSpan.Zero) throw new WaitTimeoutException(address, timeout, error);
+        var pause = (error is ApiException api ? RetryAfterHeader.Parse(ApiException.Header(api.Headers, "Retry-After"), hooks.Now()) : null)
+            ?? TransientPause;
+        await hooks.Sleep(pause < left ? pause : left, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Worth waiting out: the server or the way to it is busy or briefly down.</summary>
+    private static bool IsTransient(FakeEmailException error) => error switch
+    {
+        ApiConnectionException => true, // ApiTimeoutException included
+        RateLimitException => true,
+        ApiException api => api.Status == 503 || ApiTransport.IsGatewayError(api.Status),
+        _ => false,
+    };
+
+    private static bool IsAfterNotFound(NotFoundException error) =>
+        error.BodyJson is { ValueKind: System.Text.Json.JsonValueKind.Object } body
+        && body.TryGetProperty("message", out var message)
+        && message.ValueKind == System.Text.Json.JsonValueKind.String
+        && string.Equals(message.GetString(), AfterNotFoundMessage, StringComparison.OrdinalIgnoreCase);
 
     private static string ReadVersion()
     {

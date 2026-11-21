@@ -108,7 +108,8 @@ public sealed class MessagesResource
     /// <summary>
     /// One long poll: the earliest matching message (strictly after <see cref="MessageWaitOptions.After"/>), or
     /// <see langword="null"/> when the server's timeout passed without one. For a loop with a client-side deadline, use
-    /// <see cref="FakeEmailClient.WaitForMessageAsync"/>.
+    /// <see cref="FakeEmailClient.WaitForMessageAsync"/>. The HTTP attempt gets the server timeout + 10 s; a longer
+    /// <see cref="RequestOptions.Timeout"/> applies, a shorter one does not.
     /// </summary>
     /// <param name="address">The mailbox address.</param>
     /// <param name="options">Server timeout and filters.</param>
@@ -120,13 +121,14 @@ public sealed class MessagesResource
         return WaitOnceAsync(address, seconds, options?.After, options?.From, options?.Subject, null, cancellationToken);
     }
 
+    // maxRetries overrides the retries: the wait loop passes 0, as it owns them.
     internal Task<SimpleMessage?> WaitOnceAsync(
         string address,
         int? timeoutSeconds,
         WaitAfter? after,
         string? from,
         string? subject,
-        DateTimeOffset? deadline,
+        int? maxRetries,
         CancellationToken cancellationToken)
     {
         var serverWait = timeoutSeconds is { } s ? TimeSpan.FromSeconds(s) : DefaultServerWait;
@@ -137,14 +139,21 @@ public sealed class MessagesResource
             Query =
             [
                 new("timeout", timeoutSeconds?.ToString(System.Globalization.CultureInfo.InvariantCulture)),
-                new("after", after?.ToString()),
+                new("after", after?.QueryValue),
                 new("from", from),
                 new("subject", subject),
             ],
-            Timeout = _api.Overrides.Timeout ?? serverWait + WaitHttpMargin,
-            Deadline = deadline,
+            Timeout = WaitAttemptTimeout(serverWait, _api.Overrides.Timeout),
+            MaxRetries = maxRetries,
         };
         return _api.JsonOrNullAsync(request, FakeEmailJsonContext.Default.SimpleMessage, cancellationToken);
+    }
+
+    /// <summary>The server's hold + 10 s; an override can make it longer (or infinite), never shorter.</summary>
+    internal static TimeSpan WaitAttemptTimeout(TimeSpan serverWait, TimeSpan? overrideTimeout)
+    {
+        var floor = serverWait + WaitHttpMargin;
+        return overrideTimeout is { } o && (o == Timeout.InfiniteTimeSpan || o > floor) ? o : floor;
     }
 
     /// <summary>The full message: bodies, attachments, every code and link.</summary>
@@ -155,6 +164,16 @@ public sealed class MessagesResource
     public Task<DetailedMessage> GetAsync(string address, string id, CancellationToken cancellationToken = default) =>
         _api.JsonAsync(
             new ApiRequest { Method = HttpMethod.Get, Path = MessagePath(address, id) },
+            FakeEmailJsonContext.Default.DetailedMessage,
+            cancellationToken);
+
+    /// <summary>
+    /// <see cref="GetAsync"/> inside a wait loop: one attempt, cut short at <paramref name="deadline"/>; the loop
+    /// decides whether to try again.
+    /// </summary>
+    internal Task<DetailedMessage> GetWithinAsync(string address, string id, DateTimeOffset deadline, CancellationToken cancellationToken) =>
+        _api.JsonAsync(
+            new ApiRequest { Method = HttpMethod.Get, Path = MessagePath(address, id), MaxRetries = 0, Deadline = deadline },
             FakeEmailJsonContext.Default.DetailedMessage,
             cancellationToken);
 

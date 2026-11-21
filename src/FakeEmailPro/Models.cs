@@ -217,7 +217,12 @@ public sealed record DownloadedAttachment
     /// <summary>From <c>Content-Type</c>; <c>application/octet-stream</c> when absent.</summary>
     public string ContentType { get; init; } = "application/octet-stream";
 
-    /// <summary>From <c>Content-Disposition</c> (RFC 5987 <c>filename*</c> preferred); <see langword="null"/> if absent.</summary>
+    /// <summary>
+    /// From <c>Content-Disposition</c> (RFC 5987 <c>filename*</c> preferred). Never <see langword="null"/> from the API:
+    /// when the email gave no name, it is the attachment id; <see langword="null"/> only for a response without the
+    /// header. The sender chose it: strip directories (<see cref="System.IO.Path.GetFileName(string)"/>) before using it
+    /// as a path.
+    /// </summary>
     public string? FileName { get; init; }
 }
 

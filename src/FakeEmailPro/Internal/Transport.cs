@@ -34,7 +34,13 @@ internal sealed class ApiRequest
     /// <summary>Overrides the timeout of each HTTP attempt.</summary>
     public TimeSpan? Timeout { get; init; }
 
-    /// <summary>A time (hooks clock) past which a retry is pointless: the caller has given up by then.</summary>
+    /// <summary>Overrides the retries of the client and of a <c>WithOptions</c> view (a wait loop owns its retries).</summary>
+    public int? MaxRetries { get; init; }
+
+    /// <summary>
+    /// A time (hooks clock) the caller gives up at: no attempt runs past it (its timeout is cut to the time left) and
+    /// no retry is started that would end past it.
+    /// </summary>
     public DateTimeOffset? Deadline { get; init; }
 }
 
@@ -48,6 +54,9 @@ internal sealed record ApiResponse(int Status, HttpResponseHeaders Headers, Http
 internal sealed class ApiTransport
 {
     private static readonly TimeSpan MaxRetryAfter = TimeSpan.FromSeconds(60);
+
+    // A 503 asking for a longer pause is a state that lasts (e.g. no domain to issue, Retry-After: 60): not retried.
+    private static readonly TimeSpan MaxRetryAfter503 = TimeSpan.FromSeconds(5);
     private const double BackoffBaseMs = 500;
     private const double BackoffMaxMs = 8_000;
 
@@ -78,9 +87,11 @@ internal sealed class ApiTransport
 
     public async Task<ApiResponse> SendAsync(ApiRequest request, int maxRetries, TimeSpan timeout, CancellationToken ct)
     {
-        // DELETE is idempotent here too: a repeated delete is a 404 the caller can tolerate, never a second effect.
         var idempotent = request.Method != HttpMethod.Post;
         var url = BuildUrl(request.Path, request.Query);
+        // Set once an attempt may have reached the handler without its answer reaching us (timeout, connection error,
+        // 502/504/52x): a DELETE retried after that and answered 404 was most likely done by the lost attempt.
+        var responseLost = false;
 
         for (var attempt = 0; ; attempt++)
         {
@@ -88,10 +99,11 @@ internal sealed class ApiTransport
             ApiResponse response;
             try
             {
-                response = await AttemptAsync(request, url, timeout, ct).ConfigureAwait(false);
+                response = await AttemptAsync(request, url, AttemptTimeout(timeout, request.Deadline), ct).ConfigureAwait(false);
             }
             catch (ApiConnectionException)
             {
+                responseLost = true;
                 var delay = Backoff(attempt);
                 if (idempotent && attempt < maxRetries && Fits(delay, request.Deadline))
                 {
@@ -103,15 +115,22 @@ internal sealed class ApiTransport
             }
 
             if (response.Status is >= 200 and < 300) return response;
+            if (response.Status == 404 && responseLost && request.Method == HttpMethod.Delete)
+            {
+                return response with { Status = 204, Body = Array.Empty<byte>() };
+            }
 
             var error = ToError(response);
             var status = response.Status;
-            // 429 and 503 are refused before any effect, so even POST is safe to repeat; 502/504 may have reached
+            var gateway = IsGatewayError(status);
+            if (gateway) responseLost = true;
+            // 429 and 503 are refused before any effect, so even POST is safe to repeat; 502/504/52x may have reached
             // the handler, so only idempotent requests are repeated.
-            var retryable = status is 429 or 503 || (idempotent && status is 502 or 504);
+            var retryable = status is 429 or 503 || (idempotent && gateway);
             if (retryable && attempt < maxRetries)
             {
                 var retryAfter = RetryAfterHeader.Parse(ApiException.Header(response.Headers, "Retry-After"), Hooks.Now());
+                if (status == 503 && retryAfter > MaxRetryAfter503) throw error;
                 var delay = retryAfter is null ? Backoff(attempt) : Min(retryAfter.Value, MaxRetryAfter);
                 if (Fits(delay, request.Deadline))
                 {
@@ -122,6 +141,18 @@ internal sealed class ApiTransport
 
             throw error;
         }
+    }
+
+    /// <summary>502, 504 and Cloudflare's 520–524: the request may or may not have reached the API.</summary>
+    internal static bool IsGatewayError(int status) => status is 502 or 504 or (>= 520 and <= 524);
+
+    private TimeSpan AttemptTimeout(TimeSpan timeout, DateTimeOffset? deadline)
+    {
+        if (deadline is null) return timeout;
+        var left = deadline.Value - Hooks.Now();
+        // Already past the deadline: one short attempt still gives a clean timeout rather than an argument error.
+        if (left < TimeSpan.FromMilliseconds(1)) left = TimeSpan.FromMilliseconds(1);
+        return timeout == System.Threading.Timeout.InfiniteTimeSpan || left < timeout ? left : timeout;
     }
 
     private async Task<ApiResponse> AttemptAsync(ApiRequest request, Uri url, TimeSpan timeout, CancellationToken ct)
@@ -228,7 +259,7 @@ internal sealed class ApiCaller
     public Task<ApiResponse> SendAsync(ApiRequest request, CancellationToken ct) =>
         Transport.SendAsync(
             request,
-            Overrides.MaxRetries ?? Transport.MaxRetries,
+            request.MaxRetries ?? Overrides.MaxRetries ?? Transport.MaxRetries,
             request.Timeout ?? Overrides.Timeout ?? Transport.Timeout,
             ct);
 

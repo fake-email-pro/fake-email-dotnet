@@ -196,4 +196,103 @@ public sealed class RetryTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => t.Client.Domains.ListAsync(cts.Token));
         Assert.Single(t.Requests);
     }
+
+    [Theory]
+    [InlineData(520)]
+    [InlineData(521)]
+    [InlineData(522)]
+    [InlineData(523)]
+    [InlineData(524)]
+    public async Task Retries_GET_and_DELETE_on_Cloudflare_52x(int status)
+    {
+        using var t = new TestSetup([R.Text("cloudflare", status), Domains(), R.Text("cloudflare", status), R.Empty(204)]);
+        await t.Client.Domains.ListAsync();
+        await t.Client.Mailboxes.DeleteAsync(Address);
+        Assert.Equal(4, t.Requests.Count);
+    }
+
+    [Fact]
+    public async Task Does_not_retry_POST_on_52x()
+    {
+        using var t = new TestSetup([R.Text("cloudflare", 522), R.Json(MailboxJson, 201)]);
+        var e = await Assert.ThrowsAsync<InternalServerErrorException>(() => t.Client.Mailboxes.CreateAsync());
+        Assert.Equal(522, e.Status);
+        Assert.Single(t.Requests);
+    }
+
+    [Fact]
+    public async Task A_503_with_a_long_Retry_After_is_thrown_at_once()
+    {
+        using var t = new TestSetup([
+            R.ApiError(503, "internal_server_error", "service unavailable", ("Retry-After", "60")),
+            R.Json(MailboxJson, 201),
+        ]);
+        var e = await Assert.ThrowsAsync<InternalServerErrorException>(() =>
+            t.Client.Mailboxes.CreateAsync(new CreateMailboxOptions { Domain = "example.org" }));
+        Assert.Equal(503, e.Status);
+        Assert.Single(t.Requests);
+        Assert.Empty(t.Clock.Sleeps);
+
+        using var t2 = new TestSetup([R.ApiError(503, "internal_server_error", "service unavailable", ("Retry-After", "6")), Domains()]);
+        await Assert.ThrowsAsync<InternalServerErrorException>(() => t2.Client.Domains.ListAsync());
+        Assert.Single(t2.Requests);
+    }
+
+    [Fact]
+    public async Task A_503_with_a_short_or_no_Retry_After_is_still_retried()
+    {
+        using var t = new TestSetup([
+            R.ApiError(503, "internal_server_error", "service unavailable", ("Retry-After", "5")),
+            R.ApiError(503, "internal_server_error", "service unavailable"),
+            R.Json(MailboxJson, 201),
+        ]);
+        await t.Client.Mailboxes.CreateAsync();
+        Assert.Equal([5000.0, 1000.0], t.Clock.Sleeps);
+    }
+
+    [Fact]
+    public async Task A_DELETE_retried_after_a_lost_response_takes_404_as_done()
+    {
+        using var t = new TestSetup([
+            R.Throw(new HttpRequestException("reset")),
+            R.ApiError(404, "not_found", "mailbox not found"),
+            BadGateway(),
+            R.ApiError(404, "not_found", "message not found"),
+            R.Text("cloudflare", 524),
+            R.ApiError(429, "rate_limit_exceeded", "x", ("Retry-After", "1")),
+            R.ApiError(404, "not_found", "mailbox not found"),
+        ]);
+        await t.Client.Mailboxes.DeleteAsync(Address);
+        await t.Client.Messages.DeleteAsync(Address, MessageId);
+        await t.Client.Mailboxes.DeleteAsync(Address);
+        Assert.Equal(7, t.Requests.Count);
+    }
+
+    [Fact]
+    public async Task A_timed_out_DELETE_then_404_is_done()
+    {
+        using var t = new TestSetup([R.Hang(), R.ApiError(404, "not_found", "mailbox not found")], o => o.Timeout = TimeSpan.FromMilliseconds(20));
+        await t.Client.Mailboxes.DeleteAsync(Address);
+        Assert.Equal(2, t.Requests.Count);
+    }
+
+    [Fact]
+    public async Task A_404_on_the_first_DELETE_or_after_a_refused_one_is_NotFound()
+    {
+        using var t = new TestSetup([R.ApiError(404, "not_found", "mailbox not found")]);
+        await Assert.ThrowsAsync<NotFoundException>(() => t.Client.Mailboxes.DeleteAsync(Address));
+
+        // 429 and 503 are refused before any effect: the 404 after them is real.
+        using var t2 = new TestSetup([Limited("1"), Busy(), R.ApiError(404, "not_found", "mailbox not found")]);
+        await Assert.ThrowsAsync<NotFoundException>(() => t2.Client.Mailboxes.DeleteAsync(Address));
+        Assert.Equal(3, t2.Requests.Count);
+    }
+
+    [Fact]
+    public async Task A_GET_retried_after_a_lost_response_still_throws_404()
+    {
+        using var t = new TestSetup([BadGateway(), R.ApiError(404, "not_found", "x")]);
+        await Assert.ThrowsAsync<NotFoundException>(() => t.Client.Mailboxes.GetAsync(Address));
+        Assert.Equal(2, t.Requests.Count);
+    }
 }

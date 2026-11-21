@@ -106,12 +106,14 @@ public sealed class WaitForMessageTests
     }
 
     [Fact]
-    public async Task Gives_up_on_a_429_whose_Retry_After_passes_the_deadline()
+    public async Task A_429_whose_Retry_After_passes_the_deadline_sleeps_to_the_deadline_then_times_out()
     {
         using var t = new TestSetup([R.ApiError(429, "rate_limit_exceeded", "rate limit exceeded", ("Retry-After", "50"))]);
-        await Assert.ThrowsAsync<RateLimitException>(() =>
+        var e = await Assert.ThrowsAsync<WaitTimeoutException>(() =>
             t.Client.WaitForMessageAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(10) }));
+        Assert.IsType<RateLimitException>(e.InnerException);
         Assert.Single(t.Requests);
+        Assert.Equal([10_000.0], t.Clock.Sleeps);
     }
 
     [Fact]
@@ -209,5 +211,208 @@ public sealed class WaitForLinkTests
         ]);
         Assert.Equal("https://acme.example/magic", await t.Client.WaitForLinkAsync(Address));
         Assert.Equal("m1", t.Requests[2].Query("after"));
+    }
+}
+
+public sealed class WaitLoopRetryTests
+{
+    private static Reply Busy(string? retryAfter = null) => retryAfter is null
+        ? R.ApiError(503, "internal_server_error", "service unavailable")
+        : R.ApiError(503, "internal_server_error", "service unavailable", ("Retry-After", retryAfter));
+
+    private static Reply AfterNotFound() => R.ApiError(404, "not_found", "message in after not found");
+
+    [Fact]
+    public async Task Waits_out_every_transient_error_with_one_request_each()
+    {
+        using var t = new TestSetup([
+            R.Text("bad gateway", 502),
+            Busy("2"),
+            R.Empty(504),
+            R.Text("origin down", 520),
+            R.Text("timeout", 524),
+            R.Throw(new HttpRequestException("reset")),
+            R.ApiError(429, "too_many_waits", "x"),
+            R.Json(SimpleMessageJson()),
+        ]);
+        var res = await t.Client.WaitForMessageAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(60) });
+        Assert.Equal("048213", res.Code);
+        Assert.Equal(8, t.Requests.Count);
+        Assert.Equal([1000.0, 2000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0], t.Clock.Sleeps);
+    }
+
+    [Fact]
+    public async Task An_HTTP_timeout_of_a_wait_attempt_is_waited_out_too()
+    {
+        var timers = 0;
+        using var t = new TestSetup(
+            [R.Hang(), R.Json(SimpleMessageJson())],
+            attemptTimer: _ => ++timers == 1 ? new CancellationTokenSource(TimeSpan.FromMilliseconds(20)) : new CancellationTokenSource());
+        await t.Client.WaitForMessageAsync(Address);
+        Assert.Equal(2, t.Requests.Count);
+        Assert.Equal([1000.0], t.Clock.Sleeps);
+    }
+
+    [Fact]
+    public async Task Each_attempt_asks_for_the_time_left()
+    {
+        using var t = new TestSetup([Busy("5"), Busy("5"), R.Json(SimpleMessageJson())]);
+        await t.Client.WaitForMessageAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(30) });
+        Assert.Equal(["30", "25", "20"], t.Requests.Select(r => r.Query("timeout")));
+    }
+
+    [Fact]
+    public async Task Never_sleeps_past_the_deadline_and_ends_with_WaitTimeoutException()
+    {
+        using var t = new TestSetup([Busy("2"), Busy("2")]);
+        var e = await Assert.ThrowsAsync<WaitTimeoutException>(() =>
+            t.Client.WaitForMessageAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(3) }));
+        Assert.Equal([2000.0, 1000.0], t.Clock.Sleeps);
+        Assert.Equal(2, t.Requests.Count);
+        Assert.Equal(FakeClock.Start + TimeSpan.FromSeconds(3), t.Clock.T);
+        var inner = Assert.IsType<InternalServerErrorException>(e.InnerException);
+        Assert.Equal(503, inner.Status);
+    }
+
+    [Fact]
+    public async Task A_transport_retry_of_the_wait_request_is_never_made()
+    {
+        // MaxRetries would allow 5 transport retries; the loop sends each wait once and owns the pauses, so the
+        // pause that reaches the deadline ends the wait instead of a retry.
+        using var t = new TestSetup([Busy("1"), R.Json(SimpleMessageJson())], o => o.MaxRetries = 5);
+        await Assert.ThrowsAsync<WaitTimeoutException>(() =>
+            t.Client.WaitForMessageAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(1) }));
+        Assert.Single(t.Requests);
+        Assert.Equal([1000.0], t.Clock.Sleeps);
+    }
+
+    [Theory]
+    [InlineData(400, "bad_request", typeof(BadRequestException))]
+    [InlineData(401, "unauthorized", typeof(AuthenticationException))]
+    [InlineData(402, "quota_exhausted", typeof(QuotaExhaustedException))]
+    [InlineData(403, "plan_forbidden", typeof(PermissionDeniedException))]
+    [InlineData(404, "not_found", typeof(NotFoundException))]
+    [InlineData(409, "address_taken", typeof(ConflictException))]
+    [InlineData(500, "internal_server_error", typeof(InternalServerErrorException))]
+    public async Task Other_errors_are_thrown_at_once(int status, string code, Type expected)
+    {
+        using var t = new TestSetup([R.ApiError(status, code, "x"), R.Json(SimpleMessageJson())]);
+        var e = await Assert.ThrowsAnyAsync<ApiException>(() => t.Client.WaitForMessageAsync(Address));
+        Assert.IsType(expected, e);
+        Assert.Single(t.Requests);
+        Assert.Empty(t.Clock.Sleeps);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public async Task A_timeout_of_zero_or_less_is_already_expired(int seconds)
+    {
+        using var t = new TestSetup([R.Json(SimpleMessageJson())]);
+        await Assert.ThrowsAsync<WaitTimeoutException>(() =>
+            t.Client.WaitForCodeAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(seconds) }));
+        Assert.Empty(t.Requests);
+    }
+
+    [Fact]
+    public async Task A_short_WithOptions_timeout_does_not_cut_the_long_poll()
+    {
+        var timers = new List<TimeSpan>();
+        using var t = new TestSetup(
+            [WaitForMessageTests.Hold(), R.Json(SimpleMessageJson())],
+            attemptTimer: timeout =>
+            {
+                timers.Add(timeout);
+                return new CancellationTokenSource();
+            });
+        await t.Client.WithOptions(new RequestOptions { Timeout = TimeSpan.FromSeconds(2) })
+            .WaitForMessageAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(90) });
+        Assert.Equal([TimeSpan.FromSeconds(70), TimeSpan.FromSeconds(40)], timers);
+    }
+
+    [Fact]
+    public async Task After_a_skipped_message_is_deleted_the_wait_continues_after_its_time()
+    {
+        using var t = new TestSetup([
+            R.Json(SimpleMessageJson(id: "m1", subject: "Welcome")),
+            AfterNotFound(),
+            R.Json(SimpleMessageJson(id: "m2", subject: "Reset your password")),
+        ]);
+        var res = await t.Client.WaitForMessageAsync(Address, new WaitOptions { Match = m => m.Subject?.Contains("password", StringComparison.Ordinal) ?? false });
+        Assert.Equal("m2", res.Id);
+        Assert.Equal("m1", t.Requests[1].Query("after"));
+        Assert.Equal("2026-10-22T09:06:40.102Z", t.Requests[2].Query("after"));
+    }
+
+    [Fact]
+    public async Task The_fallback_applies_to_a_message_without_a_code_too()
+    {
+        using var t = new TestSetup([
+            R.Json(SimpleMessageJson(id: "m1", code: null)),
+            R.Json(DetailedMessageJson(id: "m1")),
+            AfterNotFound(),
+            R.Json(SimpleMessageJson(id: "m2", code: "777888")),
+        ]);
+        Assert.Equal("777888", await t.Client.WaitForCodeAsync(Address));
+        Assert.Equal("2026-10-22T09:06:40.102Z", t.Requests[3].Query("after"));
+    }
+
+    [Fact]
+    public async Task An_After_id_of_the_caller_that_is_gone_is_still_a_NotFoundException()
+    {
+        using var t = new TestSetup([AfterNotFound()]);
+        await Assert.ThrowsAsync<NotFoundException>(() => t.Client.WaitForMessageAsync(Address, new WaitOptions { After = MessageId }));
+        Assert.Single(t.Requests);
+    }
+
+    [Fact]
+    public async Task A_404_for_the_mailbox_after_a_skip_is_still_thrown()
+    {
+        using var t = new TestSetup([
+            R.Json(SimpleMessageJson(id: "m1")),
+            R.ApiError(404, "not_found", "mailbox not found or expired"),
+        ]);
+        await Assert.ThrowsAsync<NotFoundException>(() => t.Client.WaitForMessageAsync(Address, new WaitOptions { Match = _ => false }));
+        Assert.Equal(2, t.Requests.Count);
+    }
+
+    [Fact]
+    public async Task A_transient_error_of_the_full_message_read_is_waited_out_without_losing_the_message()
+    {
+        using var t = new TestSetup([
+            R.Json(SimpleMessageJson(id: "m1", code: null)),
+            Busy("1"),
+            R.Json(SimpleMessageJson(id: "m1", code: null)),
+            R.Json(DetailedMessageJson(id: "m1", codes: """["4242"]""")),
+        ], o => o.MaxRetries = 5);
+        Assert.Equal("4242", await t.Client.WaitForCodeAsync(Address));
+        Assert.Equal(["wait", "m1", "wait", "m1"], t.Requests.Select(r => r.Path.Split('/')[^1]));
+        Assert.Null(t.Requests[2].Query("after"));
+        Assert.Equal([1000.0], t.Clock.Sleeps);
+    }
+
+    [Fact]
+    public async Task The_full_message_read_is_cut_short_at_the_deadline()
+    {
+        var timers = new List<TimeSpan>();
+        using var t = new TestSetup(
+            [
+                R.Do((_, clock) =>
+                {
+                    clock.Advance(TimeSpan.FromSeconds(4));
+                    return R.Response(200, System.Text.Encoding.UTF8.GetBytes(SimpleMessageJson(id: "m1", confirmLink: null)), "application/json", []);
+                }),
+                R.Hang(),
+            ],
+            attemptTimer: timeout =>
+            {
+                timers.Add(timeout);
+                return timers.Count == 2 ? new CancellationTokenSource(TimeSpan.FromMilliseconds(20)) : new CancellationTokenSource();
+            });
+        var e = await Assert.ThrowsAsync<WaitTimeoutException>(() =>
+            t.Client.WaitForLinkAsync(Address, new WaitOptions { Timeout = TimeSpan.FromSeconds(5) }));
+        Assert.IsType<ApiTimeoutException>(e.InnerException);
+        Assert.Equal(TimeSpan.FromSeconds(1), timers[1]);
+        Assert.Equal(2, t.Requests.Count);
     }
 }

@@ -139,7 +139,11 @@ public sealed class PermissionDeniedException : ApiException
     internal PermissionDeniedException(ApiErrorResponse response) : base(response) { }
 }
 
-/// <summary>404 <c>not_found</c>: the mailbox is not an active API mailbox of yours, or the message or attachment is not there.</summary>
+/// <summary>
+/// 404 <c>not_found</c>: the mailbox is not an active API mailbox of yours, the message or attachment is not there, the
+/// <c>domain</c> of a create is unknown or not available to you, or the <c>after</c> id of a wait names no message of
+/// the mailbox.
+/// </summary>
 public sealed class NotFoundException : ApiException
 {
     internal NotFoundException(ApiErrorResponse response) : base(response) { }
@@ -193,7 +197,9 @@ public sealed class ApiTimeoutException : ApiConnectionException
 
 /// <summary>
 /// <see cref="FakeEmailClient.WaitForMessageAsync"/>, <see cref="FakeEmailClient.WaitForCodeAsync"/> or
-/// <see cref="FakeEmailClient.WaitForLinkAsync"/> reached the deadline without a matching message.
+/// <see cref="FakeEmailClient.WaitForLinkAsync"/> reached the deadline without a matching message. Transient errors
+/// met on the way are waited out, never thrown; the last one, if the wait was retrying it at the deadline, is the
+/// <see cref="Exception.InnerException"/>.
 /// </summary>
 public sealed class WaitTimeoutException : FakeEmailException
 {
@@ -201,7 +207,16 @@ public sealed class WaitTimeoutException : FakeEmailException
     /// <param name="address">The mailbox that was watched.</param>
     /// <param name="timeout">The deadline of the wait.</param>
     public WaitTimeoutException(string address, TimeSpan timeout)
-        : base($"no matching message in {address} within {timeout.TotalMilliseconds.ToString(CultureInfo.InvariantCulture)} ms")
+        : this(address, timeout, null)
+    {
+    }
+
+    /// <summary>Creates the exception with the transient error the wait was retrying when the deadline passed.</summary>
+    /// <param name="address">The mailbox that was watched.</param>
+    /// <param name="timeout">The deadline of the wait.</param>
+    /// <param name="innerException">The last transient error (e.g. a 503 or a connection error), if any.</param>
+    public WaitTimeoutException(string address, TimeSpan timeout, Exception? innerException)
+        : base($"no matching message in {address} within {timeout.TotalMilliseconds.ToString(CultureInfo.InvariantCulture)} ms", innerException)
     {
         Address = address;
         Timeout = timeout;

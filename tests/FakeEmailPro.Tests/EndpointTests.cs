@@ -198,6 +198,27 @@ public sealed class MessageEndpointTests
     }
 
     [Fact]
+    public async Task Wait_sends_no_after_for_a_default_null_or_empty_WaitAfter()
+    {
+        using var t = new TestSetup([R.Empty(204), R.Empty(204), R.Empty(204), R.Empty(204)]);
+        string? none = null;
+        await t.Client.Messages.WaitAsync(Address, new MessageWaitOptions { After = default(WaitAfter) });
+        await t.Client.Messages.WaitAsync(Address, new MessageWaitOptions { After = "" });
+        await t.Client.Messages.WaitAsync(Address, new MessageWaitOptions { After = none });
+        await t.Client.Messages.WaitAsync(Address, new MessageWaitOptions { After = null });
+        Assert.All(t.Requests, r => Assert.Equal("", r.Search));
+    }
+
+    [Fact]
+    public async Task WaitForMessage_sends_no_after_for_an_empty_WaitAfter()
+    {
+        using var t = new TestSetup([R.Json(SimpleMessageJson())]);
+        await t.Client.WaitForMessageAsync(Address, new WaitOptions { After = "" });
+        Assert.Null(t.Requests[0].Query("after"));
+        Assert.DoesNotContain("after", t.Requests[0].Search, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Wait_rounds_the_server_timeout_up_to_whole_seconds()
     {
         using var t = new TestSetup([R.Empty(204)]);
@@ -210,7 +231,7 @@ public sealed class MessageEndpointTests
     {
         var timers = new List<TimeSpan>();
         using var t = new TestSetup(
-            [R.Hang(), R.Empty(204), R.Empty(204), R.Empty(204)],
+            [R.Hang(), R.Empty(204), R.Empty(204), R.Empty(204), R.Empty(204)],
             o => o.MaxRetries = 0,
             attemptTimer: timeout =>
             {
@@ -223,9 +244,13 @@ public sealed class MessageEndpointTests
         Assert.Equal("request timed out after 11000 ms", ex.Message);
         await t.Client.Messages.WaitAsync(Address);
         await t.Client.Mailboxes.DeleteAsync(Address);
+        // A shorter override does not cut the long poll; a longer one applies.
         await t.Client.WithOptions(new RequestOptions { Timeout = TimeSpan.FromSeconds(5) }).Messages.WaitAsync(Address);
+        await t.Client.WithOptions(new RequestOptions { Timeout = TimeSpan.FromSeconds(90) }).Messages.WaitAsync(Address);
 
-        Assert.Equal([TimeSpan.FromSeconds(11), TimeSpan.FromSeconds(40), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5)], timers);
+        Assert.Equal(
+            [TimeSpan.FromSeconds(11), TimeSpan.FromSeconds(40), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(40), TimeSpan.FromSeconds(90)],
+            timers);
     }
 
     [Fact]
@@ -372,5 +397,15 @@ public sealed class ModelTests
         Assert.Equal("2026-01-02T05:04:05.000Z", at.ToString());
         Assert.Equal(WaitAfter.Message("m1"), id);
         Assert.Throws<ArgumentNullException>(() => WaitAfter.Message(null!));
+        Assert.Throws<ArgumentException>(() => WaitAfter.Message(""));
+
+        // null and "" convert to "not set", like default(WaitAfter).
+        string? none = null;
+        WaitAfter fromNull = none;
+        WaitAfter fromEmpty = "";
+        Assert.Equal(default(WaitAfter), fromNull);
+        Assert.Equal(default(WaitAfter), fromEmpty);
+        Assert.Equal("", default(WaitAfter).ToString());
+        Assert.Null(default(WaitAfter).QueryValue);
     }
 }
