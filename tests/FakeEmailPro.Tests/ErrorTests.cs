@@ -99,6 +99,10 @@ public sealed class ErrorTests
 
         var none = Assert.IsType<RateLimitException>(await FailWith(R.ApiError(429, "rate_limit_exceeded", "x")));
         Assert.Null(none.RetryAfter);
+
+        // Past what a TimeSpan holds: still a RateLimitException, never an OverflowException.
+        var huge = Assert.IsType<RateLimitException>(await FailWith(R.ApiError(429, "rate_limit_exceeded", "x", ("Retry-After", "99999999999999"))));
+        Assert.True(huge.RetryAfter > TimeSpan.FromDays(1));
     }
 
     [Fact]

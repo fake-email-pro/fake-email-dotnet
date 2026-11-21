@@ -3,6 +3,13 @@
 All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the package uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A `Retry-After` too large for a `TimeSpan` no longer throws `OverflowException`: it is read as at most a year, so
+  the response is a `RateLimitException` and the retry pause stays 60 s.
+
 ## [0.1.0] - 2026-11-22
 
 First release.

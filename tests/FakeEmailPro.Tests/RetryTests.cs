@@ -39,6 +39,14 @@ public sealed class RetryTests
     }
 
     [Fact]
+    public async Task A_Retry_After_too_large_for_a_TimeSpan_is_capped_too()
+    {
+        using var t = new TestSetup([Limited("99999999999999"), Domains()]);
+        await t.Client.Domains.ListAsync();
+        Assert.Equal([60_000.0], t.Clock.Sleeps);
+    }
+
+    [Fact]
     public async Task Retries_429_and_503_on_POST_too()
     {
         using var t = new TestSetup([Limited("1"), Busy(), R.Json(MailboxJson, 201)]);

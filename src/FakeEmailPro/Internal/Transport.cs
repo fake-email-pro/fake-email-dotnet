@@ -263,12 +263,15 @@ internal static class RetryAfterHeader
 {
     private static readonly Regex DeltaSeconds = new(@"^\d+(\.\d+)?$", RegexOptions.CultureInvariant);
 
+    // Far beyond any pause the client waits, far below what TimeSpan.FromSeconds overflows on.
+    private static readonly TimeSpan MaxParsed = TimeSpan.FromDays(365);
+
     /// <summary><c>Retry-After</c> as a delay from <paramref name="now"/> (delta-seconds or an HTTP date); null if absent or unreadable.</summary>
     public static TimeSpan? Parse(string? value, DateTimeOffset now)
     {
         if (string.IsNullOrWhiteSpace(value)) return null;
         var v = value.Trim();
-        if (DeltaSeconds.IsMatch(v)) return TimeSpan.FromSeconds(double.Parse(v, CultureInfo.InvariantCulture));
+        if (DeltaSeconds.IsMatch(v)) return TimeSpan.FromSeconds(Math.Min(double.Parse(v, CultureInfo.InvariantCulture), MaxParsed.TotalSeconds));
         if (!DateTimeOffset.TryParse(v, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date)) return null;
         var delay = date - now;
         return delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
